@@ -1,0 +1,23 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/cubs-session-start.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(curl:*statsapi.mlb.com*)",
+      "Bash(bash scripts/cubs.sh:*)",
+      "Read(./state/**)",
+      "Write(./state/**)"
+    ]
+  }
+}
