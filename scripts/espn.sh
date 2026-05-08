@@ -1,25 +1,48 @@
 #!/usr/bin/env bash
-# ESPN site API helper for NFL/NBA/NHL. Subcommands:
+# scripts/espn.sh — ESPN public site API helper for NFL/NBA/NHL.
+#
+# Subcommands:
 #   today_game <league> <teamId>             -> {eventId, gameDate, status, opponent, homeAway} or "null"
 #   summary    <league> <eventId>            -> raw summary JSON
 #   highlights <league> <eventId> [filter]   -> JSON array of {headline, description, url}
 #   tick       <league> <teamId>             -> per-tick driver. stdout is what callers print.
 #   today_status <league> <teamId>           -> short human line for SessionStart hook
 #
-# All endpoints under https://site.api.espn.com (free, no auth, undocumented).
+# All endpoints are under https://site.api.espn.com — free, no auth, but
+# undocumented. ESPN's response shape has been stable across years; if it
+# changes we degrade gracefully (silent on parse failure rather than crash).
+#
+# Security posture (full threat model in scripts/_lib.sh):
+#   - safe_curl pins the hostname allow-list, forces HTTPS+TLS1.2, caps
+#     redirects, and enforces a 5 MB response ceiling.
+#   - Every league/teamId/eventId is validated against a strict allow-list
+#     before being interpolated into a URL or jq filter.
+#   - State writes are atomic (temp + rename, mode 0600) and serialised
+#     by with_lock to avoid races between concurrent ticks.
 
 set -euo pipefail
 
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/_lib.sh
+. "$LIB_DIR/_lib.sh"
+
+# Caps on the per-tick output. Real NHL/NFL/NBA games produce far fewer
+# scoring plays than these limits, so the only time they kick in is when
+# something has gone wrong upstream.
+MAX_PLAYS_PER_TICK=50
+MAX_HIGHLIGHTS=20
+
 API_BASE="https://site.api.espn.com/apis/site/v2/sports"
 STATE_FILE="${SPORTS_STATE_FILE:-state/games.json}"
+LOCK_FILE="${STATE_FILE}.lock"
 
-# Constrain STATE_FILE to a project-relative path so an env override can't
-# redirect writes to /etc/passwd or similar. Absolute paths and any "../"
-# segments are rejected.
-case "$STATE_FILE" in
-  /*|*..*) echo "invalid SPORTS_STATE_FILE: $STATE_FILE" >&2; exit 2 ;;
-esac
+if ! valid_state_path "$STATE_FILE"; then
+  echo "invalid SPORTS_STATE_FILE: $STATE_FILE" >&2
+  exit 2
+fi
 
+# Map a league key to ESPN's URL path fragment. Hard-coded whitelist; any
+# other value fails closed with a descriptive error.
 sport_path() {
   case "$1" in
     nfl) echo "football/nfl" ;;
@@ -29,25 +52,17 @@ sport_path() {
   esac
 }
 
-valid_id() {
-  [[ "$1" =~ ^[0-9]{1,12}$ ]]
-}
-
-# ESPN event IDs are numeric in practice, but allow a few extras to be safe.
-valid_event_id() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]{1,40}$ ]]
-}
-
-valid_filter() {
-  [[ "$1" =~ ^[A-Za-z0-9.\ -]{0,40}$ ]]
-}
-
+# Lowercase->uppercase that's locale-safe (avoids tr a-z A-Z which mishandles
+# accented letters in some locales — flagged by shellcheck SC2018/SC2019).
 upper() {
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+# All HTTP fetches go through safe_curl; this alias keeps call sites
+# readable. Failures (non-2xx, oversize, hostname violation) return non-zero
+# with no stderr output — callers branch on that.
 curl_json() {
-  curl -fsL --max-time 10 "$1" 2>/dev/null
+  safe_curl "$1"
 }
 
 # Iterate all events on the scoreboard and pick the one involving teamId.
@@ -105,12 +120,12 @@ cmd_highlights() {
       [ (.header.links // [])[]? |
         select((.rel // []) | any(. == "summary" or . == "boxscore")) |
         { headline: (.text // "Game recap"), description: "", url: .href }
-      ] | unique_by(.url)
+      ] | unique_by(.url) | .[0:'"$MAX_HIGHLIGHTS"']
     '
     return 0
   fi
 
-  echo "$raw" | jq --arg f "$(printf '%s' "$filter" | tr '[:upper:]' '[:lower:]')" '
+  echo "$raw" | jq --arg f "$(printf '%s' "$filter" | tr '[:upper:]' '[:lower:]')" --argjson cap "$MAX_HIGHLIGHTS" '
     [ .videos[]? |
       {
         headline: (.headline // .title // ""),
@@ -122,7 +137,7 @@ cmd_highlights() {
       } |
       select(.url != "") |
       select($f == "" or (.headline | ascii_downcase | contains($f)))
-    ]
+    ] | .[0:$cap]
   '
 }
 
@@ -171,7 +186,9 @@ cmd_today_status() {
 }
 
 # Tick driver. State key is "<league>:<teamId>" inside state/games.json.
-cmd_tick() {
+# The public entrypoint wraps this in with_lock; see cmd_tick at the bottom
+# of the subcommand list.
+_cmd_tick_inner() {
   local league="${1:?usage: tick <league> <teamId>}"
   local teamId="${2:?usage: tick <league> <teamId>}"
   valid_id "$teamId" || { echo "invalid teamId: $teamId" >&2; return 2; }
@@ -203,8 +220,7 @@ cmd_tick() {
     team_state="$(jq -nc --argjson g "$game" --arg d "$today" \
       '{eventId: $g.eventId, date: $d, opponent: $g.opponent, homeAway: $g.homeAway, lastPlayId: ""}')"
     state="$(echo "$state" | jq -c --arg k "$key" --argjson v "$team_state" '.[$k] = $v')"
-    mkdir -p "$(dirname "$STATE_FILE")"
-    printf '%s\n' "$state" > "$STATE_FILE"
+    atomic_write "$STATE_FILE" "$state"
   fi
 
   local summary status
@@ -225,7 +241,7 @@ cmd_tick() {
         echo "[$(upper "$league")] ${vsAt^} $opponent — $localTime"
         team_state="$(echo "$team_state" | jq -c '.announced = true')"
         state="$(echo "$state" | jq -c --arg k "$key" --argjson v "$team_state" '.[$k] = $v')"
-        printf '%s\n' "$state" > "$STATE_FILE"
+        atomic_write "$STATE_FILE" "$state"
       fi
       ;;
     in)
@@ -238,17 +254,21 @@ cmd_tick() {
       clock="$(echo "$summary" | jq -r '.header.competitions[0].status.displayClock // ""')"
 
       # ESPN summary `plays` array: filter scoring + new since lastId.
-      # Some payloads put plays under .scoringPlays; try both.
+      # ESPN sometimes returns scoring plays under .scoringPlays, sometimes
+      # only under .plays with a scoringPlay flag — concatenate and let
+      # unique_by(.id) sort it out. Output is hard-capped at
+      # MAX_PLAYS_PER_TICK so a malformed feed can't flood the chat.
       local newPlays
-      newPlays="$(echo "$summary" | jq -c --arg last "$lastId" '
+      newPlays="$(echo "$summary" | jq -c --arg last "$lastId" --argjson cap "$MAX_PLAYS_PER_TICK" '
         ((.scoringPlays // []) + (.plays // [])) as $all |
         ([ $all[] | select(.scoringPlay == true) | { id: (.id // ""), text: (.text // ""), period: (.period.number // 0), clock: (.clock.displayValue // "") } ]
          | unique_by(.id)) as $scores |
-        if $last == "" then $scores
-        else
-          ($scores | map(.id) | index($last)) as $i |
-          if $i == null then $scores else $scores[($i+1):] end
-        end
+        ( if $last == "" then $scores
+          else
+            ($scores | map(.id) | index($last)) as $i |
+            if $i == null then $scores else $scores[($i+1):] end
+          end
+        ) | .[0:$cap]
       ')"
 
       local n; n="$(echo "$newPlays" | jq 'length')"
@@ -261,7 +281,7 @@ cmd_tick() {
         newLastId="$(echo "$newPlays" | jq -r '.[-1].id')"
         team_state="$(echo "$team_state" | jq -c --arg id "$newLastId" '.lastPlayId = $id')"
         state="$(echo "$state" | jq -c --arg k "$key" --argjson v "$team_state" '.[$k] = $v')"
-        printf '%s\n' "$state" > "$STATE_FILE"
+        atomic_write "$STATE_FILE" "$state"
       fi
       ;;
     post)
@@ -276,6 +296,13 @@ cmd_tick() {
       echo "[$(upper "$league")] ${vsAt^} $opponent — $status"
       ;;
   esac
+}
+
+# Public tick entrypoint: serialise mutations under a per-state-file lock
+# so concurrent /sports-update invocations can't both rewrite lastPlayId
+# and lose the latest scoring play. See with_lock in scripts/_lib.sh.
+cmd_tick() {
+  with_lock "$LOCK_FILE" _cmd_tick_inner "$@"
 }
 
 main() {

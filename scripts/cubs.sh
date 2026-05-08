@@ -1,34 +1,47 @@
 #!/usr/bin/env bash
-# CubsWin agent helpers. Subcommands:
+# scripts/cubs.sh — MLB Stats API helper for the Cubs.
+#
+# Subcommands:
 #   today_game           -> JSON {gamePk, gameDate, status, opponent, homeAway} or "null"
 #   live_feed <gamePk>   -> raw live feed JSON
 #   highlights <gamePk> [filter] -> JSON array of {headline, description, url}
 #   today_status         -> short human line for the SessionStart hook (or empty if no game)
 #   tick                 -> per-loop driver. stdout is what /cubs-update prints.
 #
-# All curl calls hit https://statsapi.mlb.com (free, no auth).
+# Security posture (see scripts/_lib.sh for the full threat model):
+#   - All curl calls are funnelled through safe_curl, which pins the
+#     hostname to the allow-list and forces HTTPS with size + redirect caps.
+#   - gamePk is validated before it reaches a URL so a hostile schedule
+#     response can't smuggle path or query injection.
+#   - State writes go through atomic_write (temp + rename, mode 0600) and
+#     are serialised by with_lock so concurrent ticks can't tear state.
 
 set -euo pipefail
+
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/_lib.sh
+. "$LIB_DIR/_lib.sh"
+
+# Output cap so a hostile or buggy live feed can't flood the chat with
+# thousands of "plays" in a single tick. ~50 plate appearances covers an
+# entire 9-inning game; anything beyond that is suspicious.
+MAX_PLAYS_PER_TICK=50
 
 CUBS_TEAM_ID=112
 SPORT_ID=1
 API_BASE="https://statsapi.mlb.com/api"
 STATE_FILE_DEFAULT="state/cubs-game.json"
 STATE_FILE="${CUBS_STATE_FILE:-$STATE_FILE_DEFAULT}"
+LOCK_FILE="${STATE_FILE}.lock"
 
-# Constrain STATE_FILE to a project-relative path (no absolute paths, no
-# parent-directory traversal). Local agent, but defense in depth.
-case "$STATE_FILE" in
-  /*|*..*) echo "invalid CUBS_STATE_FILE: $STATE_FILE" >&2; exit 2 ;;
-esac
-
-valid_game_pk() {
-  [[ "$1" =~ ^[0-9]{1,12}$ ]]
-}
-
-valid_filter() {
-  [[ "$1" =~ ^[A-Za-z0-9.\ -]{0,40}$ ]]
-}
+# Reject env-supplied state paths that escape the project tree. Defence in
+# depth: the agent typically runs in the user's account, so an attacker
+# would already need shell to set this — but we'd rather refuse than write
+# /etc/passwd.
+if ! valid_state_path "$STATE_FILE"; then
+  echo "invalid CUBS_STATE_FILE: $STATE_FILE" >&2
+  exit 2
+fi
 
 # ---- low-level helpers ------------------------------------------------------
 
@@ -38,8 +51,17 @@ today_local() {
   TZ="America/Chicago" date +%Y-%m-%d
 }
 
+# Thin alias kept for readability at call sites. Behaviour comes from
+# safe_curl in _lib.sh; see that function for the security flags.
 curl_json() {
-  curl -fsL --max-time 10 "$1" 2>/dev/null
+  safe_curl "$1"
+}
+
+# Replace the only legacy validator that callers reference. The shared
+# definition (valid_game_pk in _lib.sh? No — kept local for now) lives
+# here because gamePk is MLB-specific.
+valid_game_pk() {
+  [[ "$1" =~ ^[0-9]{1,12}$ ]]
 }
 
 # ---- subcommands ------------------------------------------------------------
@@ -100,6 +122,10 @@ cmd_highlights() {
       select(.url != "") |
       select($f == "" or (.headline | ascii_downcase | contains($f)))
     ]
+    # Hard cap on returned clips. The downstream slash command prints
+    # "up to 10" already, but capping here keeps a malicious or buggy
+    # upstream from making us pipe megabytes of mp4 URLs into bash.
+    | .[0:20]
   '
 }
 
@@ -156,11 +182,15 @@ read_state() {
 }
 
 write_state() {
-  mkdir -p "$(dirname "$STATE_FILE")"
-  printf '%s\n' "$1" > "$STATE_FILE"
+  # atomic_write writes to a sibling tmp file with mode 0600 and renames
+  # into place. Concurrent readers see either the old file or the new one,
+  # never a half-written one. See scripts/_lib.sh.
+  atomic_write "$STATE_FILE" "$1"
 }
 
-cmd_tick() {
+# The actual tick body — extracted so the public entry point can wrap it
+# in with_lock without affecting the rest of the script's structure.
+_cmd_tick_inner() {
   local game state cachedPk cachedDate today
   today="$(today_local)"
   state="$(read_state)"
@@ -203,9 +233,12 @@ cmd_tick() {
       half="$(echo "$feed" | jq -r '.liveData.linescore.inningHalf // ""')"
       inning="$(echo "$feed" | jq -r '.liveData.linescore.currentInning // 0')"
 
-      # New completed plays since last tick
+      # New completed plays since last tick. Capped at MAX_PLAYS_PER_TICK
+      # so a hostile or replay-bug feed can't flood the chat — a real game
+      # produces ~50 plate appearances total, so this only kicks in on
+      # pathological responses.
       local newPlays
-      newPlays="$(echo "$feed" | jq -c --argjson last "$lastIdx" '
+      newPlays="$(echo "$feed" | jq -c --argjson last "$lastIdx" --argjson cap "$MAX_PLAYS_PER_TICK" '
         [ .liveData.plays.allPlays[]? |
           select(.about.isComplete == true and .about.atBatIndex > $last) |
           {
@@ -218,7 +251,7 @@ cmd_tick() {
             awayScore: (.result.awayScore // 0),
             homeScore: (.result.homeScore // 0)
           }
-        ]
+        ] | .[0:$cap]
       ')"
 
       newIdx="$(echo "$newPlays" | jq 'if length == 0 then null else (max_by(.idx).idx) end')"
@@ -251,6 +284,14 @@ cmd_tick() {
       echo "Cubs $vsAt $opponent — status: $status"
       ;;
   esac
+}
+
+# Public tick: serialise mutations under a per-state-file lock so two
+# concurrent /cubs-update invocations can't both rewrite the play index
+# and lose ground. with_lock is non-blocking — if a previous tick is
+# still running, this one is silently skipped.
+cmd_tick() {
+  with_lock "$LOCK_FILE" _cmd_tick_inner "$@"
 }
 
 # ---- dispatch ---------------------------------------------------------------

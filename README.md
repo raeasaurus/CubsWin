@@ -104,10 +104,22 @@ shellcheck -f gcc -x scripts/*.sh tests/*.sh .claude/hooks/*.sh
 bash tests/security.sh
 ```
 
-`tests/security.sh` probes for shell injection, command substitution,
-path traversal in `STATE_FILE` env vars, and corrupt-state recovery
-(22 cases). The helpers reject any team name, id, or filter that contains
-shell metacharacters; state-file env overrides must be project-relative.
+`tests/security.sh` is a 37-probe suite covering:
+
+- **Input validation** — shell injection, `$(...)`, backticks, pipes,
+  non-integer ids, unknown leagues, malformed event ids
+- **Path traversal** — absolute and `..`-bearing `STATE_FILE` env overrides
+- **Corrupt-state recovery** — partial/garbage state files don't crash ticks
+- **Hostname pinning** — `safe_curl` refuses non-HTTPS, non-allow-list,
+  raw-IP, userinfo-splice, and `file://` URLs
+- **Atomic writes** — state files are mode 0600, no tmp leftovers
+- **Mutex** — `with_lock` runs the body once, skips when held
+- **Catalog integrity** — non-numeric ids, oversized names, shrunken
+  leagues are rejected on load
+- **Output caps** — highlights and per-tick plays are jq-side hard-capped
+
+All security primitives live in `scripts/_lib.sh` and are documented
+inline; see the threat model at the top of that file.
 
 ## Adding a team
 

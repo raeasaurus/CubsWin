@@ -1,2 +1,5 @@
 state/cubs-game.json
 state/games.json
+state/*.lock
+state/*.lock.d
+state/.cubswin.*

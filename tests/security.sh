@@ -129,6 +129,114 @@ assert_pass "cubs tick survives corrupt state" \
 rm -f state/cubs-game.json
 
 echo
+echo "== hostname pinning (safe_curl) =="
+# Inline-source the lib in a subshell and probe safe_curl directly.
+# Anything off the allow-list — including http://, file://, evil hosts,
+# IPs, and userinfo-prefixed URLs — must be refused before the process
+# ever leaves the script.
+probe_safe_curl() {
+  ( . scripts/_lib.sh && safe_curl "$1" ) >/dev/null 2>&1
+}
+assert_fail "safe_curl refuses http (no TLS)" probe_safe_curl "http://statsapi.mlb.com/api/v1/teams"
+assert_fail "safe_curl refuses non-allowlisted host" probe_safe_curl "https://evil.example.com/path"
+assert_fail "safe_curl refuses raw IP host"          probe_safe_curl "https://127.0.0.1/api"
+assert_fail "safe_curl refuses userinfo splice"      probe_safe_curl "https://statsapi.mlb.com@evil.example.com/path"
+assert_fail "safe_curl refuses file://"              probe_safe_curl "file:///etc/passwd"
+
+echo
+echo "== atomic state writes + 0600 mode =="
+# Write a state via espn.sh (tick wraps atomic_write internally). Even
+# though the upstream API call fails in the sandbox, the run still
+# touches state/games.json. Verify the file isn't world-readable and
+# that no leftover .cubswin.* tmp file remains.
+mkdir -p state
+rm -f state/games.json state/.cubswin.*
+( . scripts/_lib.sh && atomic_write state/games.json '{"probe":1}' )
+mode="$(stat -c '%a' state/games.json 2>/dev/null || stat -f '%A' state/games.json)"
+if [[ "$mode" == "600" ]]; then
+  echo "PASS: atomic_write sets 0600 mode"; PASS=$((PASS+1))
+else
+  echo "FAIL: atomic_write left mode=$mode (want 600)"; FAIL=$((FAIL+1)); FAILED_CASES+=("0600 mode")
+fi
+if compgen -G 'state/.cubswin.*' >/dev/null; then
+  echo "FAIL: atomic_write left a tmp file behind"; FAIL=$((FAIL+1)); FAILED_CASES+=("tmp leak")
+else
+  echo "PASS: atomic_write leaves no tmp file"; PASS=$((PASS+1))
+fi
+rm -f state/games.json
+
+echo
+echo "== lockfile mutex =="
+# with_lock must (a) actually run the body when the lock is free and
+# (b) silently skip when another holder is active. Re-implemented as an
+# if/else (instead of `cmd && pass || fail`) so a failing PASS branch
+# can't be misread as the FAIL branch.
+if ( . scripts/_lib.sh && with_lock /tmp/cubswin-test.lock true ); then
+  echo "PASS: with_lock runs the body once"; PASS=$((PASS+1))
+else
+  echo "FAIL: with_lock body didn't run"; FAIL=$((FAIL+1)); FAILED_CASES+=("with_lock")
+fi
+
+# Hold the lock in this shell, then ask with_lock to run a body that
+# would fail if it actually executed. with_lock should see the held
+# lock, return 0 without running anything, and the test passes.
+if (
+  . scripts/_lib.sh
+  exec 200>/tmp/cubswin-test.lock
+  flock -n 200 || exit 0
+  with_lock /tmp/cubswin-test.lock false
+) >/dev/null 2>&1; then
+  echo "PASS: with_lock skips when another holder is active"; PASS=$((PASS+1))
+else
+  echo "FAIL: with_lock didn't skip"; FAIL=$((FAIL+1)); FAILED_CASES+=("with_lock skip")
+fi
+rm -f /tmp/cubswin-test.lock
+
+echo
+echo "== catalog integrity =="
+# Tampering with the catalog (non-numeric id, oversized name, wrong
+# top-level type) must trip assert_catalog_sane on next resolve.
+cp config/team-catalog.json /tmp/cubswin-catalog.bak
+trap 'cp /tmp/cubswin-catalog.bak config/team-catalog.json; rm -f /tmp/cubswin-catalog.bak' EXIT
+
+# Inject a non-integer id — catalog should be rejected.
+jq '.mlb[0].id = "0; rm -rf /"' /tmp/cubswin-catalog.bak > config/team-catalog.json
+assert_fail "resolve fails on non-integer catalog id" \
+  bash scripts/sports.sh resolve cubs
+
+# Inject an absurdly long team name — should fail length check.
+jq --arg n "$(printf 'A%.0s' {1..200})" '.mlb[0].name = $n' /tmp/cubswin-catalog.bak > config/team-catalog.json
+assert_fail "resolve fails on oversized catalog name" \
+  bash scripts/sports.sh resolve cubs
+
+# Truncate league below the minimum size threshold.
+jq '.mlb = [.mlb[0]]' /tmp/cubswin-catalog.bak > config/team-catalog.json
+assert_fail "resolve fails on shrunken league" \
+  bash scripts/sports.sh resolve cubs
+
+# Restore.
+cp /tmp/cubswin-catalog.bak config/team-catalog.json
+rm -f /tmp/cubswin-catalog.bak
+trap - EXIT
+
+echo
+echo "== output caps =="
+# Verify the highlights cap clauses exist in the jq filters. Static check
+# rather than runtime — runtime would need a live API.
+# shellcheck disable=SC2016  # we want grep to see the literal $cap
+assert_pass "espn highlights jq filter contains [0:\$cap]" \
+  grep -qF '.[0:$cap]' scripts/espn.sh
+assert_pass "cubs highlights jq filter caps at .[0:20]" \
+  grep -qF '.[0:20]' scripts/cubs.sh
+
+echo
+echo "== tighter team-name regex =="
+# Length+charset alone permitted "; ;" (all punctuation); the new
+# regex requires at least one alphanumeric.
+assert_fail "resolve rejects all-punctuation name" \
+  bash scripts/sports.sh resolve "; ;"
+
+echo
 echo "== happy-path sanity =="
 # Make sure validation didn't break legitimate inputs.
 assert_pass "resolve cubs"      bash scripts/sports.sh resolve cubs

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Sports agent orchestrator. Subcommands:
+# scripts/sports.sh — orchestrator that dispatches per-league helpers.
+#
+# Subcommands:
 #   resolve <name>                   -> {league, id, name} or non-zero
 #   tick [team...]                   -> tick all defaults, or only the named teams
 #   today_status [team...]           -> human-readable status lines (one per playing team)
@@ -9,33 +11,52 @@
 #   defaults                         -> print current defaults
 #
 # Dispatches MLB to scripts/cubs.sh and NFL/NBA/NHL to scripts/espn.sh.
+#
+# Security posture (full threat model in scripts/_lib.sh):
+#   - Every team name passed in by the user is checked against
+#     valid_team_name BEFORE it touches jq, awk, or shell. The catalog is
+#     re-validated on first read via assert_catalog_sane so a tampered
+#     team-catalog.json can't escalate (e.g. by injecting a non-numeric id).
+#   - The orchestrator never builds URLs itself; URL construction lives in
+#     cubs.sh / espn.sh, both of which go through safe_curl.
+#   - State writes (config/teams.json, state/games.json) are atomic.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# shellcheck source=scripts/_lib.sh
+. "$SCRIPT_DIR/scripts/_lib.sh"
+
 CATALOG="config/team-catalog.json"
 TEAMS="config/teams.json"
 
-# Whitelist team-name characters so shell metacharacters never reach jq, awk,
-# or curl through any user-controlled path. The catalog itself is the only
-# place names with periods/spaces ever occur (e.g. "St. Louis Cardinals"),
-# so this regex covers every real input.
-valid_team_name() {
-  [[ "$1" =~ ^[A-Za-z0-9.\ -]{1,40}$ ]]
-}
-
-valid_filter() {
-  [[ "$1" =~ ^[A-Za-z0-9.\ -]{0,40}$ ]]
+# Validate the catalog the first time we touch it. This runs lazily so
+# subcommands that don't need the catalog (e.g. `defaults`) stay fast.
+_catalog_validated=0
+ensure_catalog_sane() {
+  if (( _catalog_validated == 0 )); then
+    if ! assert_catalog_sane "$CATALOG"; then
+      echo "config/team-catalog.json failed integrity check" >&2
+      echo "(run scripts/build-catalog.sh to regenerate)" >&2
+      exit 2
+    fi
+    _catalog_validated=1
+  fi
 }
 
 cmd_resolve() {
   local name="${1:?usage: resolve <name>}"
+  # Reject anything that isn't an alphanumeric-flavoured short string. The
+  # tightened regex (require at least one alphanumeric, see _lib.sh)
+  # blocks all-punctuation inputs like "; ;" that would otherwise match
+  # a length+character-set check.
   if ! valid_team_name "$name"; then
     echo "invalid team name: $name" >&2
     return 2
   fi
+  ensure_catalog_sane
   local q; q="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
   jq -e --arg q "$q" '
     [
@@ -194,7 +215,7 @@ cmd_watch() {
   updated="$(jq --arg l "$league" --argjson id "$id" --arg n "$short" \
     '.defaults |= (if any(.[]; .league == $l and .id == $id) then . else . + [{ name: $n, league: $l, id: $id }] end)' \
     "$TEAMS")"
-  printf '%s\n' "$updated" > "$TEAMS"
+  atomic_write "$TEAMS" "$updated"
   echo "Defaults:"
   echo "$updated" | jq -r '.defaults[] | "  - \(.name) (\(.league))"'
 }
@@ -209,7 +230,7 @@ cmd_unwatch() {
   updated="$(jq --arg l "$league" --argjson id "$id" \
     '.defaults |= map(select(.league != $l or .id != $id))' \
     "$TEAMS")"
-  printf '%s\n' "$updated" > "$TEAMS"
+  atomic_write "$TEAMS" "$updated"
   echo "Defaults:"
   echo "$updated" | jq -r '.defaults[] | "  - \(.name) (\(.league))"'
 }
