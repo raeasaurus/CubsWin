@@ -1,0 +1,29 @@
+{
+  "defaults": [
+    {
+      "name": "Cubs",
+      "league": "mlb",
+      "id": 112
+    },
+    {
+      "name": "Bears",
+      "league": "nfl",
+      "id": 3
+    },
+    {
+      "name": "Blackhawks",
+      "league": "nhl",
+      "id": 4
+    },
+    {
+      "name": "Avalanche",
+      "league": "nhl",
+      "id": 17
+    },
+    {
+      "name": "Spurs",
+      "league": "nba",
+      "id": 24
+    }
+  ]
+}

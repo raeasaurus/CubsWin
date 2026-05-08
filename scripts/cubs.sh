@@ -25,7 +25,7 @@ today_local() {
 }
 
 curl_json() {
-  curl -fsSL --max-time 10 "$1"
+  curl -fsL --max-time 10 "$1" 2>/dev/null
 }
 
 # ---- subcommands ------------------------------------------------------------

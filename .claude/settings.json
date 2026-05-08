@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/cubs-session-start.sh"
+            "command": ".claude/hooks/sports-session-start.sh"
           }
         ]
       }
@@ -15,9 +15,14 @@
   "permissions": {
     "allow": [
       "Bash(curl:*statsapi.mlb.com*)",
+      "Bash(curl:*site.api.espn.com*)",
       "Bash(bash scripts/cubs.sh:*)",
+      "Bash(bash scripts/espn.sh:*)",
+      "Bash(bash scripts/sports.sh:*)",
       "Read(./state/**)",
-      "Write(./state/**)"
+      "Write(./state/**)",
+      "Read(./config/**)",
+      "Write(./config/teams.json)"
     ]
   }
 }
