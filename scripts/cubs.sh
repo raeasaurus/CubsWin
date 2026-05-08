@@ -16,6 +16,20 @@ API_BASE="https://statsapi.mlb.com/api"
 STATE_FILE_DEFAULT="state/cubs-game.json"
 STATE_FILE="${CUBS_STATE_FILE:-$STATE_FILE_DEFAULT}"
 
+# Constrain STATE_FILE to a project-relative path (no absolute paths, no
+# parent-directory traversal). Local agent, but defense in depth.
+case "$STATE_FILE" in
+  /*|*..*) echo "invalid CUBS_STATE_FILE: $STATE_FILE" >&2; exit 2 ;;
+esac
+
+valid_game_pk() {
+  [[ "$1" =~ ^[0-9]{1,12}$ ]]
+}
+
+valid_filter() {
+  [[ "$1" =~ ^[A-Za-z0-9.\ -]{0,40}$ ]]
+}
+
 # ---- low-level helpers ------------------------------------------------------
 
 today_local() {
@@ -56,12 +70,17 @@ cmd_today_game() {
 
 cmd_live_feed() {
   local gamePk="${1:?usage: live_feed <gamePk>}"
+  valid_game_pk "$gamePk" || { echo "invalid gamePk: $gamePk" >&2; return 2; }
   curl_json "$API_BASE/v1.1/game/$gamePk/feed/live"
 }
 
 cmd_highlights() {
   local gamePk="${1:?usage: highlights <gamePk> [filter]}"
   local filter="${2:-}"
+  valid_game_pk "$gamePk" || { echo "invalid gamePk: $gamePk" >&2; return 2; }
+  if [[ -n "$filter" ]] && ! valid_filter "$filter"; then
+    echo "invalid filter: $filter" >&2; return 2
+  fi
   local raw
   raw="$(curl_json "$API_BASE/v1/game/$gamePk/content")" || { echo "[]"; return 0; }
 
@@ -128,7 +147,12 @@ cmd_today_status() {
 }
 
 read_state() {
-  if [[ -f "$STATE_FILE" ]]; then cat "$STATE_FILE"; else echo '{}'; fi
+  # Validate as JSON; fall back to {} if file is missing or corrupt. This is
+  # what makes a partially-written state file recoverable instead of fatal.
+  if [[ -f "$STATE_FILE" ]] && jq -c . "$STATE_FILE" 2>/dev/null; then
+    return 0
+  fi
+  echo '{}'
 }
 
 write_state() {

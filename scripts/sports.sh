@@ -18,8 +18,24 @@ cd "$SCRIPT_DIR"
 CATALOG="config/team-catalog.json"
 TEAMS="config/teams.json"
 
+# Whitelist team-name characters so shell metacharacters never reach jq, awk,
+# or curl through any user-controlled path. The catalog itself is the only
+# place names with periods/spaces ever occur (e.g. "St. Louis Cardinals"),
+# so this regex covers every real input.
+valid_team_name() {
+  [[ "$1" =~ ^[A-Za-z0-9.\ -]{1,40}$ ]]
+}
+
+valid_filter() {
+  [[ "$1" =~ ^[A-Za-z0-9.\ -]{0,40}$ ]]
+}
+
 cmd_resolve() {
   local name="${1:?usage: resolve <name>}"
+  if ! valid_team_name "$name"; then
+    echo "invalid team name: $name" >&2
+    return 2
+  fi
   local q; q="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
   jq -e --arg q "$q" '
     [
@@ -113,6 +129,10 @@ cmd_today_status() {
 cmd_highlights() {
   local team="${1:-}"
   local filter="${2:-}"
+  if [[ -n "$filter" ]] && ! valid_filter "$filter"; then
+    echo "invalid filter: $filter" >&2
+    return 2
+  fi
   if [[ -z "$team" ]]; then
     # No team given: pick the most-recent-final game from current state.
     local key

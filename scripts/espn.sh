@@ -13,6 +13,13 @@ set -euo pipefail
 API_BASE="https://site.api.espn.com/apis/site/v2/sports"
 STATE_FILE="${SPORTS_STATE_FILE:-state/games.json}"
 
+# Constrain STATE_FILE to a project-relative path so an env override can't
+# redirect writes to /etc/passwd or similar. Absolute paths and any "../"
+# segments are rejected.
+case "$STATE_FILE" in
+  /*|*..*) echo "invalid SPORTS_STATE_FILE: $STATE_FILE" >&2; exit 2 ;;
+esac
+
 sport_path() {
   case "$1" in
     nfl) echo "football/nfl" ;;
@@ -20,6 +27,23 @@ sport_path() {
     nhl) echo "hockey/nhl" ;;
     *) echo "unsupported league: $1" >&2; return 2 ;;
   esac
+}
+
+valid_id() {
+  [[ "$1" =~ ^[0-9]{1,12}$ ]]
+}
+
+# ESPN event IDs are numeric in practice, but allow a few extras to be safe.
+valid_event_id() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]{1,40}$ ]]
+}
+
+valid_filter() {
+  [[ "$1" =~ ^[A-Za-z0-9.\ -]{0,40}$ ]]
+}
+
+upper() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
 curl_json() {
@@ -30,6 +54,7 @@ curl_json() {
 cmd_today_game() {
   local league="${1:?usage: today_game <league> <teamId>}"
   local teamId="${2:?usage: today_game <league> <teamId>}"
+  valid_id "$teamId" || { echo "invalid teamId: $teamId" >&2; return 2; }
   local sp; sp="$(sport_path "$league")"
   local raw
   raw="$(curl_json "$API_BASE/$sp/scoreboard")" || { echo "null"; return 0; }
@@ -56,6 +81,7 @@ cmd_today_game() {
 cmd_summary() {
   local league="${1:?usage: summary <league> <eventId>}"
   local eventId="${2:?usage: summary <league> <eventId>}"
+  valid_event_id "$eventId" || { echo "invalid eventId: $eventId" >&2; return 2; }
   local sp; sp="$(sport_path "$league")"
   curl_json "$API_BASE/$sp/summary?event=$eventId"
 }
@@ -64,6 +90,10 @@ cmd_highlights() {
   local league="${1:?usage: highlights <league> <eventId> [filter]}"
   local eventId="${2:?usage: highlights <league> <eventId> [filter]}"
   local filter="${3:-}"
+  valid_event_id "$eventId" || { echo "invalid eventId: $eventId" >&2; return 2; }
+  if [[ -n "$filter" ]] && ! valid_filter "$filter"; then
+    echo "invalid filter: $filter" >&2; return 2
+  fi
   local sp; sp="$(sport_path "$league")"
   local raw
   raw="$(curl_json "$API_BASE/$sp/summary?event=$eventId")" || { echo "[]"; return 0; }
@@ -99,6 +129,7 @@ cmd_highlights() {
 cmd_today_status() {
   local league="${1:?usage: today_status <league> <teamId>}"
   local teamId="${2:?usage: today_status <league> <teamId>}"
+  valid_id "$teamId" || { echo "invalid teamId: $teamId" >&2; return 2; }
   local game; game="$(cmd_today_game "$league" "$teamId")"
   if [[ "$game" == "null" || -z "$game" ]]; then return 0; fi
 
@@ -143,11 +174,19 @@ cmd_today_status() {
 cmd_tick() {
   local league="${1:?usage: tick <league> <teamId>}"
   local teamId="${2:?usage: tick <league> <teamId>}"
+  valid_id "$teamId" || { echo "invalid teamId: $teamId" >&2; return 2; }
+  sport_path "$league" >/dev/null
   local key="${league}:${teamId}"
   local today; today="$(date +%Y-%m-%d)"
 
+  # Tolerate corrupted/missing state files: validate as JSON first, fall back
+  # to {} if parse fails. Avoids set -e crashes on partially-written state.
   local state team_state
-  if [[ -f "$STATE_FILE" ]]; then state="$(cat "$STATE_FILE")"; else state='{}'; fi
+  if [[ -f "$STATE_FILE" ]] && state="$(jq -c . "$STATE_FILE" 2>/dev/null)"; then
+    :
+  else
+    state='{}'
+  fi
   team_state="$(echo "$state" | jq -c --arg k "$key" '.[$k] // {}')"
 
   local cachedId cachedDate
@@ -183,7 +222,7 @@ cmd_tick() {
         local gameDate localTime
         gameDate="$(echo "$summary" | jq -r '.header.competitions[0].date')"
         localTime="$(date -d "$gameDate" "+%-I:%M %p %Z" 2>/dev/null || echo "")"
-        echo "[$(echo $league | tr a-z A-Z)] ${vsAt^} $opponent — $localTime"
+        echo "[$(upper "$league")] ${vsAt^} $opponent — $localTime"
         team_state="$(echo "$team_state" | jq -c '.announced = true')"
         state="$(echo "$state" | jq -c --arg k "$key" --argjson v "$team_state" '.[$k] = $v')"
         printf '%s\n' "$state" > "$STATE_FILE"
@@ -214,9 +253,9 @@ cmd_tick() {
 
       local n; n="$(echo "$newPlays" | jq 'length')"
       if [[ "$n" == "0" ]]; then
-        echo "[$(echo $league | tr a-z A-Z)] ${vsAt^} $opponent — P$period $clock, $away-$home"
+        echo "[$(upper "$league")] ${vsAt^} $opponent — P$period $clock, $away-$home"
       else
-        echo "[$(echo $league | tr a-z A-Z)] ${vsAt^} $opponent — P$period $clock, $away-$home"
+        echo "[$(upper "$league")] ${vsAt^} $opponent — P$period $clock, $away-$home"
         echo "$newPlays" | jq -r '.[] | "  P\(.period) \(.clock): \(.text)"'
         local newLastId
         newLastId="$(echo "$newPlays" | jq -r '.[-1].id')"
@@ -229,12 +268,12 @@ cmd_tick() {
       local away home
       away="$(echo "$summary" | jq -r '[.header.competitions[0].competitors[] | select(.homeAway=="away") | .score] | first // "?"')"
       home="$(echo "$summary" | jq -r '[.header.competitions[0].competitors[] | select(.homeAway=="home") | .score] | first // "?"')"
-      echo "[$(echo $league | tr a-z A-Z)] FINAL ${vsAt^} $opponent — $away-$home. /sports-highlights"
+      echo "[$(upper "$league")] FINAL ${vsAt^} $opponent — $away-$home. /sports-highlights"
       state="$(echo "$state" | jq -c --arg k "$key" 'del(.[$k])')"
       printf '%s\n' "$state" > "$STATE_FILE"
       ;;
     *)
-      echo "[$(echo $league | tr a-z A-Z)] ${vsAt^} $opponent — $status"
+      echo "[$(upper "$league")] ${vsAt^} $opponent — $status"
       ;;
   esac
 }

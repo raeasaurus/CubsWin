@@ -94,6 +94,21 @@ bash scripts/espn.sh summary nhl <eventId>         # raw ESPN summary
 State lives at `state/games.json`, keyed by `<league>:<teamId>`. Delete it
 to force a fresh re-detection on the next tick.
 
+## Security checks
+
+Two layers run automatically in CI (see `.github/workflows/security.yml`)
+and can be run locally:
+
+```sh
+shellcheck -f gcc -x scripts/*.sh tests/*.sh .claude/hooks/*.sh
+bash tests/security.sh
+```
+
+`tests/security.sh` probes for shell injection, command substitution,
+path traversal in `STATE_FILE` env vars, and corrupt-state recovery
+(22 cases). The helpers reject any team name, id, or filter that contains
+shell metacharacters; state-file env overrides must be project-relative.
+
 ## Adding a team
 
 Three options, in order of effort:
